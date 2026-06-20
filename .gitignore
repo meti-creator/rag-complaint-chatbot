@@ -1,0 +1,12 @@
+# Environment/System
+.env
+__pycache__/
+.DS_Store
+
+# Data/Vector Stores
+data/
+vector_store/
+
+# Virtual Environment
+venv/
+.venv/
