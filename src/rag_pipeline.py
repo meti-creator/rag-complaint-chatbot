@@ -273,6 +273,53 @@ class Generator:
             generated = self._local_tokenizer.decode(new_tokens, skip_special_tokens=True)
             return generated.strip()
 
+    def generate_stream(self, prompt: str):
+        """
+        Same as generate(), but yields the answer incrementally (token-by-token
+        for local_hf, chunk-by-chunk for anthropic) instead of returning the
+        full string at once. Used by the Gradio UI for streaming output.
+        """
+        if self.backend == "anthropic":
+            with self.client.messages.stream(
+                model=self.model_name,
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                for text in stream.text_stream:
+                    yield text
+
+        elif self.backend == "local_hf":
+            import threading
+            from transformers import TextIteratorStreamer
+
+            messages = [{"role": "user", "content": prompt}]
+            chat_text = self._local_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self._local_tokenizer(chat_text, return_tensors="pt")
+
+            # TextIteratorStreamer lets generate() run on a background thread
+            # while we read decoded text pieces from this thread as they're
+            # produced -- this is what makes token-by-token streaming possible
+            # with a local transformers model (model.generate() itself is a
+            # single blocking call with no native streaming return value).
+            streamer = TextIteratorStreamer(
+                self._local_tokenizer, skip_prompt=True, skip_special_tokens=True
+            )
+            generation_kwargs = dict(
+                **inputs,
+                max_new_tokens=400,
+                do_sample=False,
+                streamer=streamer,
+            )
+            thread = threading.Thread(target=self._local_model.generate, kwargs=generation_kwargs)
+            thread.start()
+
+            for new_text in streamer:
+                yield new_text
+
+            thread.join()
+
 
 # ---------------------------------------------------------------------------
 # Full pipeline
@@ -327,6 +374,43 @@ class RAGPipeline:
             {"content": c.page_content, "metadata": c.metadata, "score": c.score} for c in chunks
         ]
         return {"answer": answer, "sources": sources, "prompt": prompt}
+
+    def answer_stream(
+        self,
+        question: str,
+        k: Optional[int] = None,
+        product_filter: Optional[str] = None,
+    ):
+        """
+        Streaming counterpart to answer(). Does retrieval once (same as
+        answer()), then yields (partial_answer_so_far, sources) tuples as the
+        generator produces text incrementally. The UI re-renders on every
+        yield, which is what gives the token-by-token "typing" effect.
+
+        The final yielded tuple has the complete answer, identical in content
+        to what answer() would have returned in "answer".
+        """
+        k = k or self.top_k
+        chunks = self.retriever.retrieve(question, k=k, product_filter=product_filter)
+
+        sources = [
+            {"content": c.page_content, "metadata": c.metadata, "score": c.score} for c in chunks
+        ]
+
+        if not chunks:
+            yield (
+                "I don't have enough information to answer that — no relevant complaints were retrieved.",
+                sources,
+            )
+            return
+
+        context = format_context(chunks)
+        prompt = PROMPT_TEMPLATE.format(context=context, question=question)
+
+        partial = ""
+        for piece in self.generator.generate_stream(prompt):
+            partial += piece
+            yield partial, sources
 
 
 if __name__ == "__main__":
